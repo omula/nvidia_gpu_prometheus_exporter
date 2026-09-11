@@ -328,22 +328,52 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	c.lastError.Describe(ch)
 }
 
-// allocGpmSamples must be called with c.Lock held.
+// allocGpmSamples must be called with c.Lock held. A sample is only recorded
+// once both allocations succeeded, so every entry in gpmSamples1/gpmSamples2 is
+// a handle the driver actually gave us and releaseGpmSamples can hand back.
 func (c *Collector) allocGpmSamples(uuid string) nvml.Return {
-	err := nvml.SUCCESS
-	if _, exists := c.gpmSamples1[uuid]; !exists {
-		c.gpmSamples1[uuid], err = nvml.GpmSampleAlloc()
-		if err != nvml.SUCCESS {
-			log.Printf("GPU(%s) failed to allocate GpmSample1 with error: %v", uuid, err)
-			return err
+	if _, exists := c.gpmSamples1[uuid]; exists {
+		return nvml.SUCCESS
+	}
+	sample1, err := nvml.GpmSampleAlloc()
+	if err != nvml.SUCCESS {
+		log.Printf("GPU(%s) failed to allocate GpmSample1 with error: %v", uuid, err)
+		return err
+	}
+	sample2, err := nvml.GpmSampleAlloc()
+	if err != nvml.SUCCESS {
+		log.Printf("GPU(%s) failed to allocate GpmSample2 with error: %v", uuid, err)
+		if freeErr := nvml.GpmSampleFree(sample1); freeErr != nvml.SUCCESS {
+			log.Printf("GPU(%s) failed to free GpmSample1 with error: %v", uuid, freeErr)
 		}
-		c.gpmSamples2[uuid], err = nvml.GpmSampleAlloc()
-		if err != nvml.SUCCESS {
-			log.Printf("GPU(%s) failed to allocate GpmSample2 with error: %v", uuid, err)
-			return err
+		return err
+	}
+	c.gpmSamples1[uuid] = sample1
+	c.gpmSamples2[uuid] = sample2
+	return nvml.SUCCESS
+}
+
+// releaseGpmSamples gives a device's GPM sample buffers back to the driver and
+// drops its GPM state. It must be called with c.Lock held.
+//
+// GPM samples are driver-side allocations that live in this process' RM
+// resource tree, so they have to be freed when the device they belong to
+// disappears. On a node where MIG instances are created and destroyed (per
+// Slurm job, say) every new MIG UUID would otherwise add a pair of allocations
+// that is never released for as long as the exporter runs.
+func (c *Collector) releaseGpmSamples(uuid string) {
+	for name, samples := range map[string]map[string]nvml.GpmSample{
+		"GpmSample1": c.gpmSamples1,
+		"GpmSample2": c.gpmSamples2,
+	} {
+		if sample, exists := samples[uuid]; exists {
+			if err := nvml.GpmSampleFree(sample); err != nvml.SUCCESS {
+				log.Printf("GPU(%s) failed to free %s with error: %v", uuid, name, err)
+			}
+			delete(samples, uuid)
 		}
 	}
-	return err
+	delete(c.gpmState, uuid)
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
@@ -381,6 +411,10 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.nvlinkTotalRxPerSec.Reset()
 	c.nvlinkTotalTxPerSec.Reset()
 
+	// UUIDs enumerated by this scrape, so GPM state belonging to devices that
+	// have gone away can be released at the end of it.
+	seen := make(map[string]bool, len(c.gpmState))
+
 	numDevices, err := nvml.DeviceGetCount()
 	if err != nvml.SUCCESS {
 		log.Printf("DeviceCount() error: %v", err)
@@ -415,6 +449,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			c.lastError.WithLabelValues(ordinal, minor, "", "", "").Set(float64(err))
 			continue
 		}
+		seen[uuid] = true
 
 		gpm, exists := c.gpmState[uuid]
 		if !exists {
@@ -469,8 +504,15 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 				if err == nvml.SUCCESS {
 					migUuid, err := migDev.GetUUID()
 					if err != nvml.SUCCESS {
+						// Without a UUID this device would be keyed under "",
+						// sharing one GPM sample pair and one state machine
+						// with every other MIG device whose UUID failed.
+						// GpmMetricsGet requires both samples to come from the
+						// same device, so mixing them is undefined behaviour.
 						log.Printf("UUID(minor=%d, mig=%d): error: %v", minorNumber, j, err)
+						continue
 					}
+					seen[migUuid] = true
 					// Check for GPM
 					gpmMig, exists := c.gpmState[migUuid]
 					if !exists {
@@ -666,14 +708,23 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 			// Collect gpm info
 			gpm = c.gpmState[oneDev.uuid]
+			buf1, haveBuf1 := c.gpmSamples1[oneDev.uuid]
+			buf2, haveBuf2 := c.gpmSamples2[oneDev.uuid]
+			if gpm != GPM_DISABLED && (!haveBuf1 || !haveBuf2) {
+				// A missing entry reads back as a sample with a NULL handle,
+				// which must never reach an ioctl.
+				log.Printf("GPU(%s) gpm enabled without sample buffers, disabling", oneDev.uuid)
+				c.gpmState[oneDev.uuid] = GPM_DISABLED
+				gpm = GPM_DISABLED
+			}
 			var sample1 nvml.GpmSample = nil
 			var sample2 nvml.GpmSample = nil
 			if gpm != GPM_DISABLED {
 				var ret error
 				if (gpm == GPM_NO_DATA) || (gpm == GPM_SAMPLE1_SAMPLE2) {
-					ret = oneDev.device.GpmSampleGet(c.gpmSamples1[oneDev.uuid])
+					ret = oneDev.device.GpmSampleGet(buf1)
 				} else {
-					ret = oneDev.device.GpmSampleGet(c.gpmSamples2[oneDev.uuid])
+					ret = oneDev.device.GpmSampleGet(buf2)
 				}
 				if ret != nvml.SUCCESS {
 					log.Printf("GPU(%s) error collecting gpm samples: %v", uuid, ret)
@@ -684,12 +735,12 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 					c.gpmState[oneDev.uuid] = GPM_SAMPLE1_ONLY
 				case GPM_SAMPLE1_ONLY, GPM_SAMPLE2_SAMPLE1:
 					c.gpmState[oneDev.uuid] = GPM_SAMPLE1_SAMPLE2
-					sample1 = c.gpmSamples1[oneDev.uuid]
-					sample2 = c.gpmSamples2[oneDev.uuid]
+					sample1 = buf1
+					sample2 = buf2
 				case GPM_SAMPLE1_SAMPLE2:
 					c.gpmState[oneDev.uuid] = GPM_SAMPLE2_SAMPLE1
-					sample2 = c.gpmSamples1[oneDev.uuid]
-					sample1 = c.gpmSamples2[oneDev.uuid]
+					sample2 = buf1
+					sample1 = buf2
 				}
 				if sample1 != nil && sample2 != nil {
 					gpmMetric := nvml.GpmMetricsGetType{
@@ -777,6 +828,17 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
+
+	// Release the GPM samples of any device that is no longer present, e.g. a
+	// destroyed MIG instance. Deleting from gpmState while ranging over it is
+	// safe: deleted entries are simply not produced by the iteration.
+	for uuid := range c.gpmState {
+		if !seen[uuid] {
+			log.Printf("GPU(%s) no longer present, releasing gpm samples", uuid)
+			c.releaseGpmSamples(uuid)
+		}
+	}
+
 	c.usedMemory.Collect(ch)
 	c.totalMemory.Collect(ch)
 	c.dutyCycle.Collect(ch)
@@ -810,7 +872,6 @@ func main() {
 	if err := nvml.Init(); err != nvml.SUCCESS {
 		log.Fatalf("Couldn't initialize nvml: %v. Make sure NVML is in the shared library search path.", err)
 	}
-	defer nvml.Shutdown()
 
 	if driverVersion, err := nvml.SystemGetDriverVersion(); err != nvml.SUCCESS {
 		log.Printf("SystemGetDriverVersion() error: %v", err)
@@ -834,5 +895,10 @@ func main() {
 	h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})
 	http.Handle("/metrics", h)
 
-	log.Fatalf("ListenAndServe error: %v", http.ListenAndServe(*addr, nil))
+	serveErr := http.ListenAndServe(*addr, nil)
+	// Tear NVML down explicitly: log.Fatalf calls os.Exit, which skips defers.
+	if err := nvml.Shutdown(); err != nvml.SUCCESS {
+		log.Printf("Shutdown() error: %v", err)
+	}
+	log.Fatalf("ListenAndServe error: %v", serveErr)
 }
