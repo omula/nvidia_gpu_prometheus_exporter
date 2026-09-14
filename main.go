@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,13 @@ var (
 	addr                   = flag.String("web.listen-address", ":9445", "Address to listen on for web interface and telemetry.")
 	disableExporterMetrics = flag.Bool("web.disable-exporter-metrics", false, "Exclude metrics about the exporter itself (promhttp_*, process_*, go_*)")
 	disableGpm             = flag.Bool("disable.gpm", false, "Disable GPM metrics (which are available on Hopper and newer GPUs).")
+	showVersion            = flag.Bool("version", false, "Print the version of this exporter and exit.")
+
+	// version is stamped at build time with -ldflags "-X main.version=<tag>".
+	// When it is empty the VCS metadata that the Go toolchain embeds is used
+	// instead, so a plain "go build" in a checkout still yields an
+	// identifiable binary.
+	version string
 
 	labels        = []string{"ordinal", "minor_number", "uuid", "name", "GPU_I_ID"}
 	labelsJobInfo = []string{"ordinal", "minor_number", "uuid", "name", "GPU_I_ID", "jobid", "userid"}
@@ -98,6 +106,25 @@ type Device struct {
 	ordinal    string
 	instanceId string
 	device     nvml.Device
+
+	// A MIG GPU instance samples GPM through its parent device, so it has to
+	// carry both. gpuInstanceId is only meaningful when isMig is set.
+	isMig         bool
+	parent        nvml.Device
+	gpuInstanceId int
+}
+
+// gpmSampleGet reads a GPM sample for this device.
+//
+// nvmlGpmSampleGet takes a whole device. A MIG GPU instance has its own entry
+// point, nvmlGpmMigSampleGet, which takes the *parent* device plus the GPU
+// instance ID; passing a MIG device handle to the plain nvmlGpmSampleGet is
+// using the non-MIG API on a MIG handle.
+func (d Device) gpmSampleGet(sample nvml.GpmSample) nvml.Return {
+	if d.isMig {
+		return d.parent.GpmMigSampleGet(d.gpuInstanceId, sample)
+	}
+	return d.device.GpmSampleGet(sample)
 }
 
 func NewCollector() *Collector {
@@ -315,6 +342,40 @@ func NewCollector() *Collector {
 	}
 }
 
+// buildVersion identifies the source this binary was built from, so a running
+// exporter can be matched to a commit (for instance when correlating it with a
+// kernel crash on the node).
+func buildVersion() string {
+	// A stamped version already describes the build (the Makefile uses git
+	// describe, CI uses the tag), so it is used as-is.
+	if version != "" {
+		return version
+	}
+
+	var revision string
+	var modified bool
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				revision = setting.Value
+			case "vcs.modified":
+				modified = setting.Value == "true"
+			}
+		}
+	}
+	if revision == "" {
+		return "unknown"
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if modified {
+		return revision + "-dirty"
+	}
+	return revision
+}
+
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.numDevices.Desc()
 	c.usedMemory.Describe(ch)
@@ -493,7 +554,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		}
 
 		var numMigs int = 0
-		allDevs := []Device{Device{name: name, uuid: uuid, device: dev, instanceId: "", ordinal: ordinal}}
+		allDevs := []Device{Device{name: name, uuid: uuid, device: dev, instanceId: "", ordinal: ordinal, parent: dev, gpuInstanceId: -1}}
 		if currentMig == nvml.DEVICE_MIG_ENABLE {
 			numMigs, err = dev.GetMaxMigDeviceCount()
 			if err != nvml.SUCCESS {
@@ -513,6 +574,13 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 						continue
 					}
 					seen[migUuid] = true
+					migInstanceId, err := migDev.GetGpuInstanceId()
+					if err != nvml.SUCCESS {
+						// Without it there is no way to sample GPM for this
+						// instance, and the label would collide with instance 0.
+						log.Printf("GpuInstanceId(minor=%d, mig=%d): error: %v", minorNumber, j, err)
+						continue
+					}
 					// Check for GPM
 					gpmMig, exists := c.gpmState[migUuid]
 					if !exists {
@@ -541,11 +609,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 					if err != nvml.SUCCESS {
 						log.Printf("Name(minor=%d, mig=%d): error: %v", minorNumber, j, err)
 					}
-					migInstanceId, err := migDev.GetGpuInstanceId()
-					if err != nvml.SUCCESS {
-						log.Printf("Name(minor=%d, mig=%d): error: %v", minorNumber, j, err)
-					}
-					allDevs = append(allDevs, Device{name: migName, uuid: migUuid, device: migDev, ordinal: ordinal, instanceId: strconv.Itoa(migInstanceId)})
+					allDevs = append(allDevs, Device{name: migName, uuid: migUuid, device: migDev, ordinal: ordinal, instanceId: strconv.Itoa(migInstanceId), isMig: true, parent: dev, gpuInstanceId: migInstanceId})
 				} else if err != nvml.ERROR_NOT_FOUND {
 					log.Printf("GetMigDeviceHandleByInde(%d): error: %v", j, err)
 				}
@@ -720,11 +784,11 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			var sample1 nvml.GpmSample = nil
 			var sample2 nvml.GpmSample = nil
 			if gpm != GPM_DISABLED {
-				var ret error
+				var ret nvml.Return
 				if (gpm == GPM_NO_DATA) || (gpm == GPM_SAMPLE1_SAMPLE2) {
-					ret = oneDev.device.GpmSampleGet(buf1)
+					ret = oneDev.gpmSampleGet(buf1)
 				} else {
-					ret = oneDev.device.GpmSampleGet(buf2)
+					ret = oneDev.gpmSampleGet(buf2)
 				}
 				if ret != nvml.SUCCESS {
 					log.Printf("GPU(%s) error collecting gpm samples: %v", uuid, ret)
@@ -869,6 +933,13 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 func main() {
 	flag.Parse()
 
+	exporterVersion := buildVersion()
+	if *showVersion {
+		fmt.Println(exporterVersion)
+		return
+	}
+	log.Printf("Starting nvidia_gpu_prometheus_exporter %s", exporterVersion)
+
 	if err := nvml.Init(); err != nvml.SUCCESS {
 		log.Fatalf("Couldn't initialize nvml: %v. Make sure NVML is in the shared library search path.", err)
 	}
@@ -886,6 +957,19 @@ func main() {
 	collector := NewCollector()
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collector)
+
+	// Exposed as a metric as well as logged, so the build running on every node
+	// can be seen at a glance across the fleet.
+	buildInfo := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "exporter_build_info",
+			Help:      "Always 1; the version label identifies the build of this exporter",
+		},
+		[]string{"version"},
+	)
+	buildInfo.WithLabelValues(exporterVersion).Set(1)
+	registry.MustRegister(buildInfo)
 
 	gatherers := prometheus.Gatherers{registry}
 	if !*disableExporterMetrics {

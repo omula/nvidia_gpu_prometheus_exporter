@@ -29,7 +29,9 @@ jobs:
       run: echo "::set-output name=arch::$(uname -m)"
 
     - name: Build
-      run: go build -o nvml_exporter
+      # Stamp the tag into the binary so a deployed exporter reports the build
+      # it came from (-version flag, startup log line, build_info metric).
+      run: go build -ldflags "-X main.version=${{ github.ref_name }}" -o nvml_exporter
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
